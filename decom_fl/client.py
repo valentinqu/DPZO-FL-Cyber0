@@ -150,6 +150,16 @@ class ResetClient(AbstractClient):
                 self.optimizer.step()
             else:
                 raise ValueError(f"Unsupported gradient estimator: {self.grad_estimator}")
+            
+            if hasattr(self, 'dpzero_clip_threshold') and hasattr(self, 'dpzero_sigma'):
+                # 1. 裁剪 (Clipping): 限制最大绝对值
+                C = self.dpzero_clip_threshold
+                clip_factor = torch.clamp_max(C / (torch.abs(grad_scalars) + 1e-8), 1.0)
+                grad_scalars = grad_scalars * clip_factor
+                
+                # 2. 加噪 (Noising): 加上高斯分布的噪声
+                noise = torch.randn_like(grad_scalars) * self.dpzero_sigma
+                grad_scalars = grad_scalars + noise
 
             iteration_local_update_grad_vectors.append(grad_scalars)
 

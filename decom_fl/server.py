@@ -205,6 +205,7 @@ class CeZO_Server:
 
         # 4. 聚合 (Aggregation)
         # 对所有 Client 返回的标量列表取平均
+        local_grad_scalar_list = self.attack_func(local_grad_scalar_list)
         global_grad_scalar = self.aggregation_func(local_grad_scalar_list)
 
         # 5. 记录账本 (Record)

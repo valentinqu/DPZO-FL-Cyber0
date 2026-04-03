@@ -64,7 +64,17 @@ def get_cifar10_dataloaders(num_clients=10, batch_size=32, iid=True, seed=42):
     np.random.seed(seed)
 
     # 2. Data preprocessing (CIFAR-10 specific)
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.4914, 0.4822, 0.4465),
+            std=(0.2470, 0.2435, 0.2616)
+        )
+    ])
+
+    test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(
             mean=(0.4914, 0.4822, 0.4465),
@@ -75,10 +85,10 @@ def get_cifar10_dataloaders(num_clients=10, batch_size=32, iid=True, seed=42):
     # 3. Download dataset
     data_root = './data'
     train_dataset = datasets.CIFAR10(
-        root=data_root, train=True, download=True, transform=transform
+        root=data_root, train=True, download=True, transform=train_transform
     )
     test_dataset = datasets.CIFAR10(
-        root=data_root, train=False, download=True, transform=transform
+        root=data_root, train=False, download=True, transform=test_transform
     )
 
     # 4. Data partitioning
