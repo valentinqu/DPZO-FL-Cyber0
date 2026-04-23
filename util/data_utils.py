@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+import random
+import torchvision
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset, random_split
 # If Non-IID
@@ -122,4 +124,39 @@ def get_cifar10_dataloaders(num_clients=10, batch_size=32, iid=True, seed=42):
         pin_memory=True
     )
 
+    return client_loaders, test_loader
+
+
+def get_femnist_dataloaders(num_clients, batch_size):
+    print(" Downloading/Loading EMNIST (62 Classes)...")
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,), (0.229,))
+    ])
+    
+    train_dataset = torchvision.datasets.EMNIST(
+        root='./data', split='byclass', train=True, download=True, transform=transform
+    )
+    test_dataset = torchvision.datasets.EMNIST(
+        root='./data', split='byclass', train=False, download=True, transform=transform
+    )
+    
+    subset_indices = random.sample(range(len(test_dataset)), 2000)
+    fast_test_dataset = Subset(test_dataset, subset_indices)
+    
+    test_loader = DataLoader(fast_test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    num_items = int(len(train_dataset) / num_clients)
+    lengths = [num_items] * num_clients
+    lengths[-1] += len(train_dataset) - sum(lengths)
+    
+    client_datasets = random_split(
+        train_dataset, lengths, generator=torch.Generator().manual_seed(42)
+    )
+    
+    client_loaders = [
+        DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True) for ds in client_datasets
+    ]
+    
     return client_loaders, test_loader
