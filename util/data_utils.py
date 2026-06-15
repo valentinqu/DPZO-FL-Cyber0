@@ -5,48 +5,39 @@ import torchvision
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset, random_split
 # If Non-IID
-# from util.data_split import dirichlet_split 
+from util.data_split import dirichlet_split 
 
-def get_mnist_dataloaders(num_clients=10, batch_size=32, iid=True, seed=42):
+def get_mnist_dataloaders(num_clients=10, batch_size=32, iid=True, alpha=0.1, seed=42):
     """
     Download and split the MNIST dataset
     """
-    # 1. Set the random seed to ensure consistent results each time it runs.
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 2. Data Preprocessing 
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    # 3. Download the dataset
     data_root = './data'
-    # download=True 
     train_dataset = datasets.MNIST(root=data_root, train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
 
-    # 4. Data partitioning
     if iid:
-        # --- IID  (Simple average) ---
+        print(" [Data Split] Using IID Split")
         total_len = len(train_dataset)
         len_per_client = total_len // num_clients
         lengths = [len_per_client] * num_clients
-        # When dealing with remainders that cannot be divided evenly, distribute the excess to the preceding elements.
         for i in range(total_len % num_clients):
             lengths[i] += 1
-            
         client_datasets = random_split(train_dataset, lengths)
     else:
-        # --- Non-IID (Advanced) ---
-        # If use data_split.py, it can be invoked here
-        # labels = train_dataset.targets.tolist()
-        # client_datasets = dirichlet_split(train_dataset, labels, num_clients, alpha=0.5, random_seed=seed)
-        raise NotImplementedError("The Non-IID mode is currently inactive. Please first ensure the IID mode is fully operational.")
+        #启用 Non-IID 逻辑
+        print(f" [Data Split] Using Non-IID (Dirichlet) Split with alpha={alpha}")
+        labels = train_dataset.targets.tolist()
+        # 调用 data_split.py 中的函数
+        client_datasets = dirichlet_split(train_dataset, labels, num_clients, alpha=alpha, random_seed=seed)
 
-    # 5. Create DataLoader
-    # pin_memory=True  It can accelerate the transfer of data from the CPU to the GPU.
     client_loaders = [
         DataLoader(ds, batch_size=batch_size, shuffle=True, pin_memory=True) 
         for ds in client_datasets
