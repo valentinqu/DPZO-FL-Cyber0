@@ -7,10 +7,9 @@ import re
 import string
 import torch
 import numpy as np
+import os
 from transformers import AutoTokenizer
-
-
-HF_TOKEN = "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"
+from torch.utils.data import Dataset
 
 # LLM
 SUPPORTED_LLM = {
@@ -36,15 +35,28 @@ SUPPORTED_LLM = {
 
 
 def get_hf_tokenizer(hf_model_name):
+    hf_token = os.getenv("HF_TOKEN", None)
+
+    kwargs = {
+        "padding_side": "left",
+        "truncate_side": "left",
+    }
+
+    if hf_token:
+        kwargs["token"] = hf_token
+
     tokenizer = AutoTokenizer.from_pretrained(
-        hf_model_name, padding_side="left", truncate_side="left", token=HF_TOKEN
+        hf_model_name,
+        **kwargs,
     )
+
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     return tokenizer
 
 
-class CustomLMDataset(torch.utils.data.DataLoader):
+class CustomLMDataset(Dataset):
     def __init__(self, texts, tokenizer, max_length):
         self.texts = texts
         self.tokenizer = tokenizer
@@ -56,13 +68,14 @@ class CustomLMDataset(torch.utils.data.DataLoader):
     def __getitem__(self, idx):
         input_text = self.texts[idx]
         input_ids = self.tokenizer.encode(input_text, add_special_tokens=True)
-        # left_truncation
+
         if len(input_ids) > self.max_length:
-            input_ids = input_ids[-self.max_length :]
+            input_ids = input_ids[-self.max_length:]
+
         return torch.tensor(input_ids, dtype=torch.long)
 
 
-class CustomLMGenerationDataset(torch.utils.data.DataLoader):
+class CustomLMGenerationDataset(Dataset):
     def __init__(self, texts, golds, tokenizer, max_length):
         assert len(texts) == len(golds)
         self.texts = texts
@@ -76,9 +89,10 @@ class CustomLMGenerationDataset(torch.utils.data.DataLoader):
     def __getitem__(self, idx):
         input_text = self.texts[idx]
         input_ids = self.tokenizer.encode(input_text, add_special_tokens=True)
-        # left_truncation
+
         if len(input_ids) > self.max_length:
-            input_ids = input_ids[-self.max_length :]
+            input_ids = input_ids[-self.max_length:]
+
         return torch.tensor(input_ids, dtype=torch.long), (
             len(input_ids),
             self.golds[idx],
@@ -127,7 +141,7 @@ class QQPTemplate(ClassificationTemplate):
 
     def verbalize_for_pred(self, sample):
         q1 = sample["question1"].strip()
-        q2 = sample["question1"].strip()
+        q2 = sample["question2"].strip()
         return (
             f"Question 1: {q1}\n Question 2: {q2}\n Are they semantically equivalent? Yes or No?\n"
         )

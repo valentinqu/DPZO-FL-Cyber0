@@ -93,6 +93,9 @@ class ResetClient(AbstractClient):
         self.data_iterator = self._get_train_batch_iterator()
         self.last_pull_state_dict: dict | None = self.screenshot()
 
+
+    
+
     def gradient_estimator(self) -> AbstractGradientEstimator:
         return self.grad_estimator
 
@@ -102,95 +105,121 @@ class ResetClient(AbstractClient):
             for v in self.dataloader:
                 yield v
 
+    def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
+        full_state = self.model.state_dict()
+        trainable_names = [
+            name for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+
+        return {
+            name: full_state[name].detach().cpu().clone()
+            for name in trainable_names
+        }
+
+    def _optimizer_state_to_device(self) -> None:
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(self.device)
+
     def _loss_fn(self, batch_inputs, batch_labels):
         return self.criterion(self.model_inference(self.model, batch_inputs), batch_labels)
 
     def local_update(self, seeds: Sequence[int]) -> LocalUpdateResult:
-        """Returns a sequence of gradient scalar tensors for each local update.
 
-        The length of the returned sequence should be the same as the length of seeds.
-        The inner tensor can be a scalar or a vector. The length of vector is the number
-        of perturbations.
-        """
+        # 每个客户端训练前先加载自己的 LoRA adapter state
+        self.reset_model()
+
         iteration_local_update_grad_vectors: list[torch.Tensor] = []
         train_loss = Metric("Client train loss")
         train_accuracy = Metric("Client train accuracy")
 
-        for seed in seeds:  # Length of seeds equals the number of local update.
-            self.optimizer.zero_grad()
-            # NOTE:dataloader manage its own randomnes state thus not affected by seed
-            batch_inputs, labels = next(self.data_iterator)
-            if (
-                self.device != torch.device("cpu")
-                or self.grad_estimator.torch_dtype != torch.float32
-            ):
-                batch_inputs = batch_inputs.to(self.device, self.grad_estimator.torch_dtype)
-                if isinstance(labels, torch.Tensor):  # In generation mode, labels are not tensor.
-                    labels = labels.to(self.device)  # NOTE: label does not convert to dtype
+        try:
+            for seed in seeds:
+                self.optimizer.zero_grad(set_to_none=True)
 
-            # declare grad_scalars before assigning it to avoid no-redef type check
-            grad_scalars: torch.Tensor
-            if isinstance(
-                self.grad_estimator,
-                (RandomGradientEstimatorParamwise, AdamForwardGradientEstimatorParamwise),
-            ):
-                grad_scalars = self.grad_estimator._zo_grad_estimate_paramwise(
-                    batch_inputs, labels, self._loss_fn, seed
-                )
-                self.grad_estimator.update_model_given_seed_and_grad(
-                    self.optimizer, [seed], [grad_scalars]
-                )
-            elif isinstance(
-                self.grad_estimator,
-                (RandomGradientEstimatorBatch, AdamForwardGradientEstimatorBatch, RandomGradientEstimator),
-            ):
-                grad_scalars = self.grad_estimator.compute_grad(
-                    batch_inputs, labels, self._loss_fn, seed
-                )
-                self.optimizer.step()
-            else:
-                raise ValueError(f"Unsupported gradient estimator: {self.grad_estimator}")
-            
-            if hasattr(self, 'dpzero_clip_threshold') and hasattr(self, 'dpzero_sigma'):
-                # 1. 裁剪 (Clipping): 限制最大绝对值
-                C = self.dpzero_clip_threshold
-                clip_factor = torch.clamp_max(C / (torch.abs(grad_scalars) + 1e-8), 1.0)
-                grad_scalars = grad_scalars * clip_factor
-                
-                # 2. 加噪 (Noising): 加上高斯分布的噪声
-                noise = torch.randn_like(grad_scalars) * self.dpzero_sigma
-                grad_scalars = grad_scalars + noise
+                batch_inputs, labels = next(self.data_iterator)
+                if (
+                    self.device != torch.device("cpu")
+                    or self.grad_estimator.torch_dtype != torch.float32
+                ):
+                    batch_inputs = batch_inputs.to(self.device, self.grad_estimator.torch_dtype)
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.to(self.device)
 
-            iteration_local_update_grad_vectors.append(grad_scalars)
+                grad_scalars: torch.Tensor
 
-            # get_train_info
-            pred = self.model_inference(self.model, batch_inputs)
-            train_loss.update(self.criterion(pred, labels))
-            train_accuracy.update(self.accuracy_func(pred, labels))
+                if isinstance(
+                    self.grad_estimator,
+                    (RandomGradientEstimatorParamwise, AdamForwardGradientEstimatorParamwise),
+                ):
+                    grad_scalars = self.grad_estimator._zo_grad_estimate_paramwise(
+                        batch_inputs, labels, self._loss_fn, seed
+                    )
+                    self.grad_estimator.update_model_given_seed_and_grad(
+                        self.optimizer, [seed], [grad_scalars]
+                    )
 
-        return LocalUpdateResult(
-            grad_tensors=iteration_local_update_grad_vectors,
-            step_accuracy=train_accuracy.avg,
-            step_loss=train_loss.avg,
-        )
+                elif isinstance(
+                    self.grad_estimator,
+                    (RandomGradientEstimatorBatch, AdamForwardGradientEstimatorBatch, RandomGradientEstimator),
+                ):
+                    grad_scalars = self.grad_estimator.compute_grad(
+                        batch_inputs, labels, self._loss_fn, seed
+                    )
+                    self.optimizer.step()
+
+                else:
+                    raise ValueError(f"Unsupported gradient estimator: {self.grad_estimator}")
+
+                # 暂时保持现有 DP 逻辑，不在这里改 DP 机制
+                if hasattr(self, "dpzero_clip_threshold") and hasattr(self, "dpzero_sigma"):
+                    C = self.dpzero_clip_threshold
+                    clip_factor = torch.clamp_max(
+                        C / (torch.abs(grad_scalars) + 1e-8),
+                        1.0,
+                    )
+                    grad_scalars = grad_scalars * clip_factor
+
+                    noise = torch.randn_like(grad_scalars) * self.dpzero_sigma
+                    grad_scalars = grad_scalars + noise
+
+                iteration_local_update_grad_vectors.append(grad_scalars)
+
+                pred = self.model_inference(self.model, batch_inputs)
+                train_loss.update(self.criterion(pred, labels))
+                train_accuracy.update(self.accuracy_func(pred, labels))
+
+            result = LocalUpdateResult(
+                grad_tensors=iteration_local_update_grad_vectors,
+                step_accuracy=train_accuracy.avg,
+                step_loss=train_loss.avg,
+            )
+
+            return result
+
+        finally:
+            self.reset_model()
 
     def reset_model(self) -> None:
-        """Reset the mode to the state before the local_update."""
         assert self.last_pull_state_dict is not None
-        self.model.load_state_dict(self.last_pull_state_dict["model"], strict=False)
-        
-        self.optimizer.load_state_dict(self.last_pull_state_dict["optimizer"])
+
+        self.model.load_state_dict(
+            self.last_pull_state_dict["model"],
+            strict=False,
+        )
+
+        self.optimizer.load_state_dict(
+            self.last_pull_state_dict["optimizer"]
+        )
+        self._optimizer_state_to_device()
+        self.optimizer.zero_grad(set_to_none=True)
 
     def screenshot(self) -> dict:
-        # 提取 requires_grad=True 的 LoRA 参数
-        trainable_keys = [name for name, param in self.model.named_parameters() if param.requires_grad]
-        
-        # 只克隆 LoRA 权重存进内存
-        lora_state_dict = {k: self.model.state_dict()[k].cpu().clone() for k in trainable_keys}
-        
         return {
-            "model": lora_state_dict, 
-            "optimizer": deepcopy(self.optimizer.state_dict())
+            "model": self._get_trainable_state_dict(),
+            "optimizer": deepcopy(self.optimizer.state_dict()),
         }
 
     def pull_model(
