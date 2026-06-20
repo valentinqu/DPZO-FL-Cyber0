@@ -42,9 +42,9 @@ class SeedAndGradientRecords:
         - grad_records[i]: [vector for local_update_k for k in range(K)]
         - grad_records[i][k]: scalar for 1 perturb or vector for >=1 perturb
 
-        What should happen on clients pull server using grad_records[i][k]:
-        - client use seed_records[i][k] to generate perturbation(s)
-        - client_grad[i][k]: vector = mean(perturbations[j] * grad_records[i][k][j] for j)
+        In stateful DeComFL, clients can replay missed global updates from these records.
+        Stateless full-model LLM clients simply ignore pull_model(); the server still uses
+        the same record structure to keep the ZO seed/scalar update history consistent.
         """
 
         self.seed_records: deque[list[int]] = deque()
@@ -60,7 +60,7 @@ class SeedAndGradientRecords:
 
     def remove_too_old(self, earliest_record_needs: int):
         if self.earliest_records >= earliest_record_needs:
-            return  # No need to do anything
+            return
         while self.earliest_records < earliest_record_needs:
             self.seed_records.popleft()
             self.grad_records.popleft()
@@ -105,7 +105,7 @@ class CeZO_Server:
         self.gradient_estimator: AbstractGradientEstimator | None = None
 
         self._aggregation_func: AggregationFunc = fed_avg
-        self._attack_func: AttackFunc = lambda x: x  # No attach
+        self._attack_func: AttackFunc = lambda x: x
 
     def set_server_model_and_criterion(
         self,
@@ -124,18 +124,23 @@ class CeZO_Server:
         self.gradient_estimator = gradient_estimator
 
     def get_sampled_client_index(self) -> list[int]:
-        return random.sample(range(len(self.clients)), self.num_sample_clients)
+        n = min(self.num_sample_clients, len(self.clients))
+        return random.sample(range(len(self.clients)), n)
 
     def set_perturbation(self, num_pert: int) -> None:
         for client in self.clients:
             client.gradient_estimator().num_pert = num_pert
+        if self.gradient_estimator is not None:
+            self.gradient_estimator.num_pert = num_pert
 
     def set_learning_rate(self, lr: float) -> None:
-        # Client
+        # Stateful CNN clients have optimizers; stateless LLM clients may use optimizer=None.
         for client in self.clients:
-            for p in client.optimizer.param_groups:
-                p["lr"] = lr
-        # Server
+            client_optim = getattr(client, "optimizer", None)
+            if client_optim is not None:
+                for p in client_optim.param_groups:
+                    p["lr"] = lr
+
         if self.server_model and self.optim:
             for p in self.optim.param_groups:
                 p["lr"] = lr
@@ -151,80 +156,55 @@ class CeZO_Server:
         return self._attack_func(local_grad_scalar_list)
 
     def register_aggregation_func(self, aggregation_func: AggregationFunc) -> None:
-        # TODO add function signature check
         self._aggregation_func = aggregation_func
 
     def register_attack_func(self, attack_func: AttackFunc) -> None:
-        # TODO add function signature check
         self._attack_func = attack_func
 
     def train_one_step(self, iteration: int) -> tuple[float, float]:
-        # 1. 采样客户端
+        assert self.gradient_estimator is not None and self.optim is not None
+
         sampled_client_index = self.get_sampled_client_index()
-        
-        # 2. 生成本轮所有的随机种子 (Server 下发种子)
-        # 这里的 seeds 是给 Client 本地训练每一步用的
         seeds = [random.randint(0, 1000000) for _ in range(self.local_update_steps)]
 
-        # 3. 核心循环：拉取模型 + 本地训练
-        # (替代了 execute_sampled_clients)
         local_grad_scalar_list = []
         total_loss = 0.0
         total_acc = 0.0
-        
+
         for index in sampled_client_index:
             client = self.clients[index]
-            
-            # --- A. Client Pull (重放) ---
-            # Client 需要从 Server 获取“由于自己上次更新以来”错过的所有历史记录
             last_update_idx = self.client_last_updates[index]
-            
-            # 从账本中获取历史种子和标量
-            # fetch_seed_records 需要你在 SeedAndGradientRecords 类里确认是否是从 idx 开始取
-            # 假设 fetch 逻辑是取 [last_update_idx, current_iteration] 之间的记录
-            if iteration > 0: # 第一轮不需要 pull
-                # 注意：SeedAndGradientRecords 的实现细节可能需要微调
-                # 这里假设 fetch 接口接收的是“我需要的起始索引”
+
+            if iteration > 0:
                 seeds_history = self.seed_grad_records.fetch_seed_records(last_update_idx)
                 grads_history = self.seed_grad_records.fetch_grad_records(last_update_idx)
-                
-                # 执行 Pull (Replay)
                 client.pull_model(seeds_history, grads_history)
-            
-            # 更新该 Client 的最后同步时间
+
             self.client_last_updates[index] = iteration
 
-            # --- B. Client Local Update (计算标量) ---
-            # 这一步只算标量，不更新本地模型
             if hasattr(client, "current_round"):
                 client.current_round = iteration
-                
+
             result = client.local_update(seeds)
-            
-            # 收集结果
+
             local_grad_scalar_list.append(result.grad_tensors)
             total_loss += result.step_loss
             total_acc += result.step_accuracy
 
-        # 4. 聚合 (Aggregation)
-        # 对所有 Client 返回的标量列表取平均
         local_grad_scalar_list = self.attack_func(local_grad_scalar_list)
         global_grad_scalar = self.aggregation_func(local_grad_scalar_list)
 
-        # 5. 记录账本 (Record)
         self.seed_grad_records.add_records(seeds=seeds, grad=global_grad_scalar)
         self.seed_grad_records.remove_too_old(earliest_record_needs=min(self.client_last_updates))
 
-        # 6. Server 更新全局模型 (Replay Global Model)
         if self.server_model:
-            self.server_model.train()
-            # 利用种子和聚合后的标量，重构梯度并更新 Server 模型
+            # Keep eval mode for LLM ZO to avoid dropout randomness during subsequent scalar evaluation.
+            self.server_model.eval()
             self.gradient_estimator.update_model_given_seed_and_grad(
                 self.optim,
                 seeds,
                 global_grad_scalar,
             )
-            # 同时也更新 Estimator 的内部状态 (如果是 AdamForward 需要这个)
             self.gradient_estimator.update_gradient_estimator_given_seed_and_grad(
                 seeds,
                 global_grad_scalar,
@@ -246,14 +226,14 @@ class CeZO_Server:
         eval_accuracy = Metric("Eval accuracy")
         with torch.no_grad():
             for _, (batch_inputs, batch_labels) in enumerate(test_loader):
-                if (
-                    self.device != torch.device("cpu")
-                    or self.gradient_estimator.torch_dtype != torch.float32
-                ):
-                    batch_inputs = batch_inputs.to(self.device, self.gradient_estimator.torch_dtype)
-                    # In generation mode, labels are not tensor.
-                    if isinstance(batch_labels, torch.Tensor):
-                        batch_labels = batch_labels.to(self.device)
+                if hasattr(batch_inputs, "to"):
+                    batch_inputs = batch_inputs.to(device=self.device)
+                elif isinstance(batch_inputs, torch.Tensor):
+                    batch_inputs = batch_inputs.to(self.device)
+
+                if isinstance(batch_labels, torch.Tensor):
+                    batch_labels = batch_labels.to(self.device)
+
                 pred = self.server_model_inference(self.server_model, batch_inputs)
                 eval_loss.update(self.server_criterion(pred, batch_labels))
                 eval_accuracy.update(self.server_accuracy_func(pred, batch_labels))
