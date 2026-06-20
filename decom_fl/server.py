@@ -196,6 +196,9 @@ class CeZO_Server:
 
             # --- B. Client Local Update (计算标量) ---
             # 这一步只算标量，不更新本地模型
+            if hasattr(client, "current_round"):
+                client.current_round = iteration
+                
             result = client.local_update(seeds)
             
             # 收集结果

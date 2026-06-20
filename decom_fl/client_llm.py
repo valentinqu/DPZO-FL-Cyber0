@@ -78,6 +78,8 @@ class ResetClient(AbstractClient):
         criterion: CriterionType,
         accuracy_func,
         device: torch.device,
+        client_id: int | None = None,
+        scalar_stats_logger=None,
     ):
         self.model = model
         self.model_inference = model_inference
@@ -89,6 +91,10 @@ class ResetClient(AbstractClient):
         self.optimizer = optimizer
         self.criterion = criterion
         self.accuracy_func = accuracy_func
+
+        self.client_id = client_id
+        self.current_round: int | None = None
+        self.scalar_stats_logger = scalar_stats_logger
 
         self.data_iterator = self._get_train_batch_iterator()
         self.last_pull_state_dict: dict | None = self.screenshot()
@@ -136,7 +142,7 @@ class ResetClient(AbstractClient):
         train_accuracy = Metric("Client train accuracy")
 
         try:
-            for seed in seeds:
+            for local_step_idx, seed in enumerate(seeds):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 batch_inputs, labels = next(self.data_iterator)
@@ -172,6 +178,15 @@ class ResetClient(AbstractClient):
 
                 else:
                     raise ValueError(f"Unsupported gradient estimator: {self.grad_estimator}")
+                
+                # 记录 DP clipping / noise 之前的 raw grad_scalars
+                if self.scalar_stats_logger is not None:
+                    self.scalar_stats_logger.log(
+                        grad_scalars,
+                        round_idx=self.current_round,
+                        client_id=self.client_id,
+                        local_step=local_step_idx,
+                    )
 
                 # 暂时保持现有 DP 逻辑，不在这里改 DP 机制
                 if hasattr(self, "dpzero_clip_threshold") and hasattr(self, "dpzero_sigma"):

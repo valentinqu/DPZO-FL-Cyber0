@@ -1,65 +1,145 @@
-from opacus.accountants import RDPAccountant
+from dataclasses import dataclass
+from math import sqrt
 
-def compute_required_noise(
-    target_epsilon: float,
-    total_samples: int,
-    batch_size: int,
-    rounds: int,
-    num_sample_clients: int,
-    local_steps: int,
-    delta: float = 1e-5,
-    tolerance: float = 1e-4
-) -> float:
-    """
-    根据给定的epsilon 反推所需的 noise_multiplier (dp_sigma)
-    """
-    total_steps = rounds * num_sample_clients * local_steps 
-    sample_rate = batch_size / total_samples
+from opacus.accountants.utils import get_noise_multiplier
 
-    low_noise = 0.01
-    high_noise = 100.0
-    best_noise = high_noise
 
-    for _ in range(100):
-        mid_noise = (low_noise + high_noise) / 2.0
-        
-        accountant = RDPAccountant()
-        accountant.history = [(mid_noise, sample_rate, total_steps)]
-        eps = accountant.get_epsilon(delta=delta)
-        
-        if eps > target_epsilon:
-            low_noise = mid_noise
-        else:
-            best_noise = mid_noise
-            high_noise = mid_noise
+@dataclass(frozen=True)
+class FLDPConfig:
+    name: str
 
-        if abs(eps - target_epsilon) < tolerance:
-            break
+    # Dataset / FL setting
+    total_train_samples: int
+    num_clients: int
+    num_sample_clients: int
+    batch_size: int
 
-    return best_noise
+    # Training setting
+    rounds: int
+    local_steps: int
+    num_perturbations: int
+
+    # DP setting
+    clip_threshold: float
+    delta: float = 1e-5
+
+    @property
+    def samples_per_client(self) -> float:
+        return self.total_train_samples / self.num_clients
+
+    @property
+    def client_sample_rate(self) -> float:
+        return min(1.0, self.num_sample_clients / self.num_clients)
+
+    @property
+    def batch_sample_rate_within_client(self) -> float:
+        return min(1.0, self.batch_size / self.samples_per_client)
+
+    @property
+    def effective_record_sample_rate(self) -> float:
+        """
+        Approximate record-level sampling rate.
+
+        A record is used in a local step when:
+        1. its client is sampled;
+        2. it appears in the current local batch.
+        """
+        return min(
+            1.0,
+            self.client_sample_rate * self.batch_sample_rate_within_client,
+        )
+
+    @property
+    def dp_steps(self) -> int:
+        """
+        Current implementation applies clipping/noising once per local step.
+        For one record, the approximate number of mechanisms is rounds * local_steps.
+        Do not multiply by num_sample_clients here.
+        """
+        return self.rounds * self.local_steps
+
+    @property
+    def elementwise_vector_l2_bound(self) -> float:
+        """
+        Current implementation clips each scalar element independently.
+        If we view P perturbation scalars as one vector, its L2 upper bound is C * sqrt(P).
+        """
+        return self.clip_threshold * sqrt(self.num_perturbations)
+
+
+def compute_noise_multiplier(target_epsilon: float, cfg: FLDPConfig) -> float:
+    return get_noise_multiplier(
+        target_epsilon=target_epsilon,
+        target_delta=cfg.delta,
+        sample_rate=cfg.effective_record_sample_rate,
+        steps=cfg.dp_steps,
+        accountant="rdp",
+        epsilon_tolerance=1e-4,
+    )
+
+
+def print_noise_table(cfg: FLDPConfig, target_epsilons=(2.0, 5.0, 8.0, 10.0)):
+    print(f"\n=== {cfg.name} ===")
+    print(f"total_train_samples          = {cfg.total_train_samples}")
+    print(f"num_clients                  = {cfg.num_clients}")
+    print(f"num_sample_clients           = {cfg.num_sample_clients}")
+    print(f"samples_per_client approx    = {cfg.samples_per_client:.2f}")
+    print(f"batch_size                   = {cfg.batch_size}")
+    print(f"rounds                       = {cfg.rounds}")
+    print(f"local_steps                  = {cfg.local_steps}")
+    print(f"num_perturbations            = {cfg.num_perturbations}")
+    print(f"clip_threshold C             = {cfg.clip_threshold}")
+    print(f"delta                        = {cfg.delta}")
+    print(f"client_sample_rate           = {cfg.client_sample_rate:.6f}")
+    print(f"batch_sample_rate/client     = {cfg.batch_sample_rate_within_client:.6f}")
+    print(f"effective_record_sample_rate = {cfg.effective_record_sample_rate:.6f}")
+    print(f"dp_steps                     = {cfg.dp_steps}")
+    print("-" * 80)
+
+    for eps in target_epsilons:
+        noise_multiplier = compute_noise_multiplier(eps, cfg)
+
+        # 这个是当前代码最应该填入 args.dp_sigma 的值：
+        # 因为 client_llm.py 里 dp_sigma 是 absolute Gaussian std。
+        scalar_only_abs_sigma = noise_multiplier * cfg.clip_threshold
+
+        # 更保守的 P 维向量口径，先不建议作为主实验。
+        p_dim_l2_abs_sigma = noise_multiplier * cfg.elementwise_vector_l2_bound
+
+        # DPZero per-sample scalar 机制的参考值。
+        # 你当前代码还不是这个机制，所以这里只作为参考。
+        dpzero_style_reference = (
+            2.0 * noise_multiplier * cfg.clip_threshold / cfg.batch_size
+        )
+
+        print(f"target epsilon = {eps:>4.1f}")
+        print(f"  noise_multiplier                    = {noise_multiplier:.6f}")
+        print(f"  scalar-only abs sigma [USE THIS]    = {scalar_only_abs_sigma:.6f}")
+        print(f"  P-dim L2 abs sigma [conservative]   = {p_dim_l2_abs_sigma:.6f}")
+        print(f"  DPZero-style reference              = {dpzero_style_reference:.6f}")
+        print()
+
 
 if __name__ == "__main__":
-    TOTAL_SAMPLES = 67349        # MNIST 总样本数
-    BATCH_SIZE = 8             # 客户端 batch_size
-    ROUNDS = 100                 # 全局训练轮次 (如果以后改跑 200 轮，记得改这里)
-    NUM_SAMPLE_CLIENTS = 5      # 每轮实际参与的客户端数量
-    LOCAL_STEPS = 5              # 本地迭代步数
-    DELTA = 1e-5                 # DP 的 delta (一般设为 1/样本数 或更小)
-    
-    target_epsilons = [2.0, 5.0, 8.0, 10.0]
-    
-    print("=== 联邦学习 DPZO 噪声推导工具 ===")
-    print(f"设定: 样本={TOTAL_SAMPLES}, Batch={BATCH_SIZE}, 轮次={ROUNDS}, 客户端={NUM_SAMPLE_CLIENTS}, 本地步数={LOCAL_STEPS}")
-    print("-" * 50)
-    
-    for target_eps in target_epsilons:
-        required_sigma = compute_required_noise(
-            target_epsilon=target_eps,
-            total_samples=TOTAL_SAMPLES,
-            batch_size=BATCH_SIZE,
-            rounds=ROUNDS,
-            num_sample_clients=NUM_SAMPLE_CLIENTS,
-            local_steps=LOCAL_STEPS,
-            delta=DELTA
-        )
-        print(f"目标 Epsilon (ε) = {target_eps:>4.1f}  -->  请在代码中设定 dp_sigma = {required_sigma:.4f}")
+    # 对应 decom_fl_llm_main.py 当前 SST-2 / OPT-125M LoRA 配置：
+    # num_clients=20
+    # num_sample_clients=20
+    # rounds=100
+    # local_steps=5
+    # train_batch_size=8
+    # zo_n_pert=10
+    # C 根据 raw scalar calibration 设为 15.0
+    llm_sst2_cfg = FLDPConfig(
+        name="LLM SST-2 / OPT-125M LoRA / FL-ZO current mechanism",
+        total_train_samples=67349,
+        num_clients=20,
+        num_sample_clients=20,
+        batch_size=8,
+        rounds=100,
+        local_steps=5,
+        num_perturbations=10,
+        clip_threshold=15.0,
+        delta=1e-5,
+    )
+
+    print_noise_table(llm_sst2_cfg)

@@ -12,6 +12,7 @@ from util.llm_data_utils import get_sst2_dataloaders
 from models.llm_model import get_opt_lora_model
 from util.language_utils import SST2Template, get_hf_tokenizer, last_token_cross_entropy_loss, last_token_accuracy
 from util.gradient_estimators.random_gradient_estimator import RandomGradientEstimator, RandomGradEstimateMethod
+from util.scalar_stats import RawScalarStatsLogger
 
 # ==========================================
 # 1. 核心防御：NNM + Trimmed Mean
@@ -45,22 +46,29 @@ def cyber0_trimmed_mean(local_grad_scalar_list, trim_ratio=0.25, nnm_k=12):
 # ==========================================
 # 2. 攻击者：FOE 攻击
 # ==========================================
-def foe_attack(local_grad_scalar_list, num_attackers=4):
+def foe_attack(local_grad_scalar_list, num_attackers=4, omega=5.0):
     num_clients = len(local_grad_scalar_list)
-    omega = 5.0 
+
     honest_list = local_grad_scalar_list[num_attackers:]
-    honest_tensors = torch.stack([torch.stack(client_steps) for client_steps in honest_list])
+    honest_tensors = torch.stack([
+        torch.stack(client_steps)
+        for client_steps in honest_list
+    ])
     honest_mean = honest_tensors.mean(dim=0)
-    
+
     malicious_tensor = (1.0 - omega) * honest_mean
-    malicious_steps = [malicious_tensor[i] for i in range(malicious_tensor.shape[0])]
-    
+    malicious_steps = [
+        malicious_tensor[i]
+        for i in range(malicious_tensor.shape[0])
+    ]
+
     attacked_list = []
     for i in range(num_clients):
         if i < num_attackers:
             attacked_list.append(malicious_steps)
         else:
             attacked_list.append(local_grad_scalar_list[i])
+
     return attacked_list
 
 # ==========================================
@@ -86,20 +94,30 @@ class Args:
     seed = 42
 
     # DP 与 攻击配置
-    dp_clip_threshold = 1000.0  #33.7249
-    dp_sigma = 0.0
+    dp_clip_threshold = 15
+    # Choose one:
+    # epsilon≈10 -> 6.2139
+    # epsilon≈8  -> 6.6672
+    # epsilon≈5  -> 7.7688
+    # epsilon≈2  -> 10.6061
+    dp_sigma = 6.2139
 
-    #目标 Epsilon (ε) =  2.0  -->  请在代码中设定 dp_sigma = 0.5566
-    #目标 Epsilon (ε) =  5.0  -->  请在代码中设定 dp_sigma = 0.4028
-    #目标 Epsilon (ε) =  8.0  -->  请在代码中设定 dp_sigma = 0.3452
-    #目标 Epsilon (ε) = 10.0  -->  请在代码中设定 dp_sigma = 0.3220
 
     num_attackers = 4
     attack_type = "FOE"
+    foe_omega = 5.0
+
+    trim_ratio = 0.2
+    nnm_k = 0
 
     # 数据异构配置
     iid = True     
     alpha = 0.5      
+
+    # Raw scalar calibration
+    collect_raw_scalar_stats = False
+    scalar_stats_path = "output/languages/scalar_stats/sst2_opt125m_lora_raw_scalars.csv"
+    scalar_stats_max_vectors = None
 
 args = Args()
 
@@ -181,16 +199,27 @@ def setup_system():
             normalize_perturbation=False,
             paramwise_perturb=args.paramwise
         )
+
+        scalar_stats_logger = None
+
+        if args.collect_raw_scalar_stats:
+            scalar_stats_logger = RawScalarStatsLogger(
+                output_path=args.scalar_stats_path,
+                candidate_cs=(10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 800, 1000),
+                max_vectors=args.scalar_stats_max_vectors,
+            )
         
         client = ResetClient(
-            model=global_model,               
-            model_inference=llm_inference,    
+            model=global_model,
+            model_inference=llm_inference,
             dataloader=client_loaders[i],
             grad_estimator=local_estimator,
             optimizer=local_optimizer,
-            criterion=llm_criterion,          
-            accuracy_func=llm_accuracy,       
-            device=torch.device(args.device)
+            criterion=llm_criterion,
+            accuracy_func=llm_accuracy,
+            device=torch.device(args.device),
+            client_id=i,
+            scalar_stats_logger=scalar_stats_logger,
         )
         client.dpzero_clip_threshold = args.dp_clip_threshold
         client.dpzero_sigma = args.dp_sigma
@@ -214,21 +243,33 @@ def setup_system():
     )
 
     # 4.6 注册防御与攻击
-    server.register_aggregation_func(lambda x: cyber0_trimmed_mean(x, trim_ratio=0.20, nnm_k=0))
+    server.register_aggregation_func(
+    lambda x: cyber0_trimmed_mean(
+        x,
+        trim_ratio=args.trim_ratio,
+        nnm_k=args.nnm_k,
+    )
+)
     
     if args.attack_type == "FOE":
-        server.register_attack_func(lambda x: foe_attack(x, num_attackers=args.num_attackers))
+        server.register_attack_func(
+    lambda x: foe_attack(
+        x,
+        num_attackers=args.num_attackers,
+        omega=args.foe_omega,
+    )
+)
     else:
         server.register_attack_func(lambda x: x) 
     
-    return server, test_loader
+    return server, test_loader, scalar_stats_logger
 
 # ==========================================
 # 5. 训练循环
 # ==========================================
 if __name__ == "__main__":
     set_seed(args.seed)
-    server, test_loader = setup_system()
+    server, test_loader, scalar_stats_logger = setup_system()
     
     history = {"loss": [], "acc": []}
     
@@ -252,6 +293,6 @@ if __name__ == "__main__":
 
             # 保存数据到 CSV
             row = pd.DataFrame([{"loss": test_loss, "acc": test_acc}])
-            row.to_csv("llm_sst2_iid_nodp_attack_nodefense_20clients.csv", mode="a", header=False, index=False)
+            row.to_csv("llm_sst2_iid_dp10.0_attack_20clients.csv", mode="a", header=False, index=False)
 
     print(f"\n Training complete! Final LLM Accuracy: {history['acc'][-1]*100:.2f}%")
