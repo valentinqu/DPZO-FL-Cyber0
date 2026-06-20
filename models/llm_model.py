@@ -42,3 +42,16 @@ def get_roberta_mlm_model(
     print("=================================================\n")
 
     return model
+
+
+def get_opt_lora_model(*args, **kwargs):
+    """
+    Deprecated compatibility alias.
+
+    The LLM thesis pipeline no longer uses LoRA. Use get_roberta_mlm_model()
+    or run decom_fl_llm_roberta_main.py.
+    """
+    raise RuntimeError(
+        "LoRA has been removed from the main LLM pipeline. "
+        "Use get_roberta_mlm_model() for full-model RoBERTa ZO."
+    )
