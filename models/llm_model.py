@@ -1,29 +1,44 @@
 import torch
-from transformers import AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForMaskedLM
 
-def get_opt_lora_model(device="cuda"):
+
+def get_roberta_mlm_model(
+    model_name: str = "FacebookAI/roberta-base",
+    device: str | torch.device = "cuda",
+    torch_dtype: torch.dtype | None = None,
+):
     """
-    加载由 Google/Facebook 论文推荐的 opt-125m 并植入 LoRA 适配器
+    Load a full RoBERTa masked-language-model for pure zero-order fine-tuning.
+
+    Important design choice:
+    - No LoRA / PEFT adapters are used here.
+    - All model parameters are considered trainable from the ZO perspective.
+    - The implementation should use forward-only ZO updates; no backward pass is needed.
+
+    This keeps the LLM experiment closer to the CyBeR-0 / MeZO-style setup:
+    clients transmit directional scalar values, not adapter matrices or gradients.
     """
-    hf_model_name = "facebook/opt-125m"
-    
-    # 1. 以因果语言模型（Causal LM 文字接龙）形式加载预训练权重
-    model = AutoModelForCausalLM.from_pretrained(hf_model_name)
-    
-    # 2. 配置低秩矩阵 LoRA 
-    lora_config = LoraConfig(
-        r=8,                # 秩大小
-        lora_alpha=16,      # 缩放系数
-        target_modules=["q_proj", "v_proj"], # 仅让 Attention 的 Q 和 V 矩阵参与联邦训练
-    )
-    
-    # 3. 挂载 LoRA
-    lora_model = get_peft_model(model, lora_config)
-    
-    # 打印可训练参数占比
-    print("\n====== LoRA 参数配置成功 ======")
-    lora_model.print_trainable_parameters()
-    print("================================\n")
-    
-    return lora_model.to(device)
+    kwargs = {}
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+
+    model = AutoModelForMaskedLM.from_pretrained(model_name, **kwargs)
+
+    # ZO does not need autograd, but the existing estimator filters parameters
+    # with requires_grad=True. Therefore we keep all parameters marked trainable.
+    for param in model.parameters():
+        param.requires_grad = True
+
+    model.to(device)
+    model.eval()  # Disable dropout for stable finite-difference estimates.
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print("\n====== Full-model RoBERTa ZO configuration ======")
+    print(f"Model: {model_name}")
+    print(f"Trainable parameters for ZO: {trainable_params:,} / {total_params:,}")
+    print("LoRA/PEFT: disabled")
+    print("Backpropagation: disabled by design; use forward-only ZO")
+    print("=================================================\n")
+
+    return model
