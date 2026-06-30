@@ -47,7 +47,7 @@ def get_sst2_dataloaders(
     tokenizer = get_hf_tokenizer(
         model_name,
         padding_side="right",
-        truncation_side="right",
+        truncation_side="left",
     )
 
     raw_train_dataset = _maybe_select_subset(raw_dataset["train"], max_train_samples, seed)

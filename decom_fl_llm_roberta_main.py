@@ -74,12 +74,13 @@ class Args:
     iid = True
     alpha = 0.5
 
-    rounds = 100
+    rounds = 200
     local_steps = 1
     train_batch_size = 16
     test_batch_size = 32
     lr = 1e-6
     weight_decay = 0.0
+    eval_interval = 10
 
     zo_mu = 1e-3
     zo_n_pert = 1
@@ -87,13 +88,17 @@ class Args:
     paramwise = True
     sgd_only_no_optim = True
 
-    enable_dp = False
-    dp_clip_threshold = 1e9
+    enable_dp = True
+    dp_clip_threshold = 100.0
     dp_sigma = 0.0
 
-    attack_type = "FOE"
+    #target epsilon= 2.0 -> set args.dp_sigma=  429.8750 (checked epsilon=1.9997)
+    #target epsilon= 5.0 -> set args.dp_sigma=  190.5313 (checked epsilon=4.9999)
+    #target epsilon=10.0 -> set args.dp_sigma=  105.9199 (checked epsilon=10.0000)
+
+    attack_type = "None"
     foe_omega = 5.0
-    trim_ratio = 0.25
+    trim_ratio = 0.0
     nnm_k = 0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,7 +108,7 @@ class Args:
     scalar_stats_path = "output/languages/scalar_stats/roberta_sst2_fullzo_raw_scalars.csv"
     scalar_stats_max_vectors = None
 
-    output_csv = "roberta_sst2_fullzo_smoke.csv"
+    output_csv = "roberta_sst2_dp_clippingonly.csv"
     overwrite_output = True
 
 
@@ -152,7 +157,7 @@ def setup_system():
         paramwise_perturb=args.paramwise,
         sgd_only_no_optim=args.sgd_only_no_optim,
     )
-    tokenizer = get_hf_tokenizer(args.model_name, padding_side="right", truncation_side="right")
+    tokenizer = get_hf_tokenizer(args.model_name, padding_side="right", truncation_side="left")
     verbalizer_id_list = get_roberta_sst2_verbalizer_ids(tokenizer)
 
     def llm_inference(model, x):
@@ -231,7 +236,10 @@ if __name__ == "__main__":
     with torch.no_grad(), tqdm(range(args.rounds), desc="Training") as t:
         for round_idx in t:
             train_loss, train_acc = server.train_one_step(iteration=round_idx)
-            test_loss, test_acc = server.eval_model(test_loader)
+            if round_idx == 0 or (round_idx + 1) % args.eval_interval == 0:
+                test_loss, test_acc = server.eval_model(test_loader)
+            else:
+                test_loss, test_acc = history["loss"][-1], history["acc"][-1]
             history["loss"].append(test_loss)
             history["acc"].append(test_acc)
             t.set_postfix({
