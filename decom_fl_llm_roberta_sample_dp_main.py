@@ -24,6 +24,7 @@ from util.gradient_estimators.random_gradient_estimator import (
 from util.gradient_estimators.sample_level_dp_random_gradient_estimator import (
     SampleLevelDPRandomGradientEstimator,
 )
+from util.scalar_stats import RawScalarStatsLogger
 
 
 # ==========================================
@@ -113,8 +114,10 @@ class Args:
     sample_dp_clip_threshold = 100.0
     sample_dp_sigma = 0.0
 
-    # Example values from an Opacus sample-level accountant should be converted
-    # to this absolute averaged-scalar sigma before being used here.
+    # Raw per-sample scalar calibration.
+    collect_raw_sample_scalar_stats = False
+    sample_scalar_stats_path = "output/languages/scalar_stats/roberta_sst2_sample_level_raw_scalars.csv"
+    sample_scalar_stats_max_vectors = None
 
     # Attack / defense
     attack_type = "None"  # "None" or "FOE"
@@ -201,6 +204,14 @@ def setup_system():
             reduction="none",
         )
 
+    sample_scalar_stats_logger = None
+    if args.collect_raw_sample_scalar_stats:
+        sample_scalar_stats_logger = RawScalarStatsLogger(
+            output_path=args.sample_scalar_stats_path,
+            candidate_cs=(10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 800, 1000),
+            max_vectors=args.sample_scalar_stats_max_vectors,
+        )
+
     clients = []
     for i in range(args.num_clients):
         local_estimator = SampleLevelDPRandomGradientEstimator(
@@ -225,6 +236,7 @@ def setup_system():
             accuracy_func=llm_accuracy,
             device=torch.device(args.device),
             client_id=i,
+            scalar_stats_logger=sample_scalar_stats_logger,
         )
         clients.append(client)
 
@@ -249,13 +261,13 @@ def setup_system():
     else:
         server.register_attack_func(lambda x: x)
 
-    return server, test_loader
+    return server, test_loader, sample_scalar_stats_logger
 
 
 if __name__ == "__main__":
     set_seed(args.seed)
     prepare_output_file()
-    server, test_loader = setup_system()
+    server, test_loader, sample_scalar_stats_logger = setup_system()
     history = {"loss": [], "acc": []}
 
     with torch.no_grad(), tqdm(range(args.rounds), desc="Sample-level DP ZO") as t:
@@ -279,5 +291,9 @@ if __name__ == "__main__":
                 header=False,
                 index=False,
             )
+
+    if sample_scalar_stats_logger is not None:
+        sample_scalar_stats_logger.print_summary()
+        sample_scalar_stats_logger.close()
 
     print(f"Final LLM Accuracy: {history['acc'][-1] * 100:.2f}%")
