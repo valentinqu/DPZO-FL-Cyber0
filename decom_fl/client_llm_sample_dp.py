@@ -43,6 +43,7 @@ class SampleLevelDPClient:
         accuracy_func: Callable[[Any, torch.Tensor], torch.Tensor],
         device: torch.device,
         client_id: int | None = None,
+        scalar_stats_logger=None,
     ):
         self.model = model
         self.model_inference = model_inference
@@ -53,6 +54,7 @@ class SampleLevelDPClient:
         self.accuracy_func = accuracy_func
         self.device = device
         self.client_id = client_id
+        self.scalar_stats_logger = scalar_stats_logger
         self.current_round: int | None = None
         self.optimizer = None
         self.data_iterator = self._get_train_batch_iterator()
@@ -89,7 +91,7 @@ class SampleLevelDPClient:
         iteration_grad_scalars: list[torch.Tensor] = []
 
         with torch.no_grad():
-            for seed in seeds:
+            for local_step_idx, seed in enumerate(seeds):
                 batch_inputs, labels = next(self.data_iterator)
                 batch_inputs, labels = self._move_batch_to_device(batch_inputs, labels)
 
@@ -102,6 +104,10 @@ class SampleLevelDPClient:
                     per_sample_loss_fn=self.per_sample_criterion,
                     model_inference=inference_closure,
                     seed=seed,
+                    scalar_stats_logger=self.scalar_stats_logger,
+                    round_idx=self.current_round,
+                    client_id=self.client_id,
+                    local_step_idx=local_step_idx,
                 )
                 iteration_grad_scalars.append(grad_scalars)
 
