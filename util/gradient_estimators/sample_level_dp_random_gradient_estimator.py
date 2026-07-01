@@ -52,6 +52,10 @@ class SampleLevelDPRandomGradientEstimator(RandomGradientEstimator):
         per_sample_loss_fn: Callable[[object, torch.Tensor], torch.Tensor],
         model_inference: Callable[[object], object],
         seed: int,
+        scalar_stats_logger=None,
+        round_idx: int | None = None,
+        client_id: int | None = None,
+        local_step_idx: int | None = None,
     ) -> torch.Tensor:
         """
         Compute DPZero-style private directional scalars.
@@ -63,6 +67,9 @@ class SampleLevelDPRandomGradientEstimator(RandomGradientEstimator):
             model_inference: zero-argument closure returning model output for
                 the current batch_inputs.
             seed: seed used to regenerate perturbation directions.
+            scalar_stats_logger: optional RawScalarStatsLogger-like logger used
+                to record raw per-sample directional scalars before clipping.
+            round_idx/client_id/local_step_idx: metadata for the logger.
 
         Returns:
             Tensor of shape [num_pert], where each entry is a noised averaged
@@ -77,17 +84,17 @@ class SampleLevelDPRandomGradientEstimator(RandomGradientEstimator):
         C = self.sample_dp_clip_threshold
 
         for perturb_idx in range(self.num_pert):
-            # θ + μz
+            # theta + mu z
             rng = self.get_rng(seed, perturb_idx)
             self.perturb_model_paramwise(rng, alpha=self.mu)
             loss_plus_vec = per_sample_loss_fn(model_inference(), labels)
 
-            # θ - μz
+            # theta - mu z
             rng = self.get_rng(seed, perturb_idx)
             self.perturb_model_paramwise(rng, alpha=-2 * self.mu)
             loss_minus_vec = per_sample_loss_fn(model_inference(), labels)
 
-            # Restore θ
+            # Restore theta
             rng = self.get_rng(seed, perturb_idx)
             self.perturb_model_paramwise(rng, alpha=self.mu)
 
@@ -101,7 +108,23 @@ class SampleLevelDPRandomGradientEstimator(RandomGradientEstimator):
                     "per_sample_loss_fn must return a 1-D tensor of shape [batch_size]."
                 )
 
+            # Raw per-sample directional scalars: one scalar per training example.
             sample_dir_scalars = (loss_plus_vec - loss_minus_vec) / (2 * self.mu)
+
+            # Optional calibration logging BEFORE clipping/noise.
+            if scalar_stats_logger is not None:
+                # We re-use the existing RawScalarStatsLogger. Its column name
+                # `perturb_idx` will correspond to the flattened sample index here.
+                logger_step = local_step_idx
+                if logger_step is not None and self.num_pert > 1:
+                    logger_step = logger_step * self.num_pert + perturb_idx
+                scalar_stats_logger.log(
+                    sample_dir_scalars.detach(),
+                    round_idx=round_idx,
+                    client_id=client_id,
+                    local_step=logger_step,
+                )
+
             clipped = torch.clamp(sample_dir_scalars, min=-C, max=C)
             private_scalar = clipped.mean()
 
